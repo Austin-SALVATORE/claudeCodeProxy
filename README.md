@@ -23,10 +23,51 @@ export PROBE_MODEL="..."                          # optional; defaults to first 
 uv run probe.py
 ```
 
-`uv` resolves `httpx` from the inline script metadata into a throwaway
+`uv` resolves dependencies from the inline script metadata into a throwaway
 environment, so nothing is installed system-wide. The script talks only to
 `$PROBE_BASE_URL`, and credentials are read from the environment — never
 written to disk.
+
+### TLS behind a corporate proxy
+
+Corporate networks terminate TLS with a private root CA. Python's HTTP clients
+default to the `certifi` bundle, which has no knowledge of that CA, so
+verification fails even though macOS trusts the certificate everywhere else.
+
+The probe therefore defaults to the **system trust store** via `truststore`
+(macOS Keychain, Windows CertStore, Linux `ca-certificates`). If IT installed
+the root CA on your machine, it works with no configuration.
+
+| Variable | Effect |
+| --- | --- |
+| *(default)* | System trust store — Keychain on macOS |
+| `PROBE_CA_BUNDLE=/path/corp-ca.pem` | Explicit PEM bundle; overrides the system store |
+| `PROBE_TLS=certifi` | Ignore the system store, use the `certifi` bundle |
+| `PROBE_TLS=insecure` | Disable verification — **diagnosis only, never a fix** |
+
+`HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` are honoured automatically.
+
+If verification still fails, identify the intercepting CA:
+
+```bash
+openssl s_client -showcerts -connect your-gateway:443 </dev/null 2>/dev/null \
+  | openssl x509 -noout -issuer -subject
+```
+
+and export the system roots to a bundle:
+
+```bash
+security find-certificate -a -p \
+  /Library/Keychains/System.keychain \
+  /System/Library/Keychains/SystemRootCertificates.keychain \
+  > corp-ca.pem
+
+PROBE_CA_BUNDLE=$PWD/corp-ca.pem uv run probe.py
+```
+
+If the issuer is one your machine has never been given, request the root CA PEM
+from IT. `PROBE_TLS=insecure` confirms TLS is the cause; it is not a remedy, and
+the proxy itself must never ship with verification disabled.
 
 ### What it checks
 

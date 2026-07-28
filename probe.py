@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["httpx"]
+# dependencies = ["httpx", "truststore"]
 # ///
 """Probe an OpenAI-compatible endpoint for the capabilities Claude Code needs.
 
@@ -10,11 +10,23 @@ Usage:
     export PROBE_MODEL="your-model-name"   # optional; auto-picked from /models
     uv run probe.py
 
+TLS behind a corporate proxy:
+    By default this uses the *system* trust store (macOS Keychain, Windows
+    CertStore, Linux ca-certificates) via `truststore`, so a corporate root CA
+    installed by IT is trusted automatically. Override if needed:
+
+    PROBE_CA_BUNDLE=/path/corp-ca.pem   explicit PEM bundle; wins over system store
+    PROBE_TLS=certifi                   ignore system store, use certifi bundle
+    PROBE_TLS=insecure                  disable verification (diagnosis only)
+
+    HTTPS_PROXY / HTTP_PROXY / NO_PROXY are honoured automatically.
+
 Prints a capability report. Sends no data anywhere except your endpoint.
 """
 
 import json
 import os
+import ssl
 import sys
 
 import httpx
@@ -32,6 +44,75 @@ if API_KEY:
 
 TIMEOUT = httpx.Timeout(60.0, connect=15.0)
 results: dict[str, object] = {}
+
+CA_BUNDLE = os.environ.get("PROBE_CA_BUNDLE", "")
+TLS_MODE = os.environ.get("PROBE_TLS", "system").lower()
+
+
+def build_verify() -> "ssl.SSLContext | bool":
+    """Resolve TLS trust, preferring the OS trust store over certifi.
+
+    Corporate networks terminate TLS with a private root CA that IT installs
+    into the system trust store. certifi -- which httpx uses by default -- has
+    no knowledge of it, so verification fails even though the machine trusts
+    the certificate everywhere else.
+    """
+    if TLS_MODE == "insecure":
+        print(
+            "!! PROBE_TLS=insecure -- certificate verification is OFF.\n"
+            "!! Use this only to confirm TLS is the problem, never as a fix.\n",
+            file=sys.stderr,
+        )
+        results["_tls_mode"] = "insecure (UNVERIFIED)"
+        return False
+
+    if CA_BUNDLE:
+        if not os.path.isfile(CA_BUNDLE):
+            sys.exit(f"PROBE_CA_BUNDLE does not exist: {CA_BUNDLE}")
+        ctx = ssl.create_default_context(cafile=CA_BUNDLE)
+        results["_tls_mode"] = f"explicit bundle: {CA_BUNDLE}"
+        return ctx
+
+    if TLS_MODE == "certifi":
+        results["_tls_mode"] = "certifi bundle"
+        return True
+
+    try:
+        import truststore
+
+        ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        results["_tls_mode"] = "system trust store (truststore)"
+        return ctx
+    except ImportError:
+        results["_tls_mode"] = "certifi bundle (truststore unavailable)"
+        return True
+
+
+def explain_tls_failure(exc: Exception) -> None:
+    """Turn an opaque TLS error into the specific next action."""
+    print("\n" + "=" * 60, file=sys.stderr)
+    print(f"TLS verification failed: {exc}", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    host = BASE_URL.split("://", 1)[-1].split("/", 1)[0]
+    if ":" not in host:
+        host += ":443"
+    print(
+        "\nThis usually means a corporate CA is intercepting the connection and\n"
+        "is not in the trust store being used.\n\n"
+        "1. See which CA actually signs the endpoint:\n"
+        f"     openssl s_client -showcerts -connect {host} </dev/null 2>/dev/null \\\n"
+        "       | openssl x509 -noout -issuer -subject\n\n"
+        "2. Export your system roots to a PEM bundle (macOS):\n"
+        "     security find-certificate -a -p \\\n"
+        "       /Library/Keychains/System.keychain \\\n"
+        "       /System/Library/Keychains/SystemRootCertificates.keychain \\\n"
+        "       > corp-ca.pem\n\n"
+        "3. Retry against that bundle:\n"
+        "     PROBE_CA_BUNDLE=$PWD/corp-ca.pem uv run probe.py\n\n"
+        "If step 1 shows an issuer your machine has never been given, ask IT for\n"
+        "the root CA PEM -- do not work around it with PROBE_TLS=insecure.\n",
+        file=sys.stderr,
+    )
 
 
 def report(name: str, ok: bool, detail: str = "") -> None:
@@ -273,9 +354,28 @@ def probe_context_window(client: httpx.Client, model: str) -> None:
     report("~25k-token prompt", True, f"accepted; usage={r.json().get('usage', {})}")
 
 
+def preflight(client: httpx.Client) -> None:
+    """Fail fast, and loudly, on TLS problems before running the real probes."""
+    try:
+        client.get(f"{BASE_URL}/models", headers=HEADERS)
+    except httpx.ConnectError as exc:
+        if isinstance(exc.__cause__, ssl.SSLCertVerificationError) or "CERTIFICATE" in str(exc).upper():
+            explain_tls_failure(exc)
+            sys.exit(1)
+        sys.exit(f"Cannot reach {BASE_URL}: {exc}\nCheck the URL, VPN, and HTTPS_PROXY.")
+    except httpx.HTTPError:
+        pass  # non-TLS errors are the individual probes' business
+
+
 def main() -> None:
-    print(f"Probing {BASE_URL}\n" + "=" * 60)
-    with httpx.Client(timeout=TIMEOUT, follow_redirects=True) as client:
+    verify = build_verify()
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "none"
+    print(f"Probing {BASE_URL}", flush=True)
+    print(f"TLS trust : {results['_tls_mode']}", flush=True)
+    print(f"Proxy     : {proxy}", flush=True)
+    print("=" * 60, flush=True)
+    with httpx.Client(timeout=TIMEOUT, follow_redirects=True, verify=verify) as client:
+        preflight(client)
         ids = probe_models(client)
         model = MODEL or (ids[0] if ids else "")
         if not model:
