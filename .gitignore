@@ -23,3 +23,8 @@ dist/
 *.swp
 *.swo
 *~
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
