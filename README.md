@@ -47,16 +47,28 @@ the root CA on your machine, it works with no configuration.
 
 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` are honoured automatically.
 
-If verification still fails, identify the intercepting CA:
+If verification still fails, export the system roots to a bundle and point the
+probe at it. On failure the script prints the commands for the platform it is
+running on.
+
+**Windows (PowerShell):**
+
+```powershell
+Get-ChildItem Cert:\LocalMachine\Root | ForEach-Object {
+  "-----BEGIN CERTIFICATE-----"
+  [Convert]::ToBase64String($_.RawData, 'InsertLineBreaks')
+  "-----END CERTIFICATE-----"
+} | Out-File -Encoding ascii corp-ca.pem
+
+$env:PROBE_CA_BUNDLE = "$PWD\corp-ca.pem"; uv run .\probe.py
+```
+
+**macOS:**
 
 ```bash
 openssl s_client -showcerts -connect your-gateway:443 </dev/null 2>/dev/null \
   | openssl x509 -noout -issuer -subject
-```
 
-and export the system roots to a bundle:
-
-```bash
 security find-certificate -a -p \
   /Library/Keychains/System.keychain \
   /System/Library/Keychains/SystemRootCertificates.keychain \

@@ -88,27 +88,60 @@ def build_verify() -> "ssl.SSLContext | bool":
         return True
 
 
+_WINDOWS_TLS_HELP = """\
+1. See which CA actually signs the endpoint (PowerShell):
+     $c = [Net.HttpWebRequest]::Create("{url}")
+     $c.Proxy = [Net.WebRequest]::GetSystemWebProxy()
+     try {{ $c.GetResponse() }} catch {{}}
+     $c.ServicePoint.Certificate.Issuer
+
+2. Export the machine's trusted roots to a PEM bundle (PowerShell):
+     Get-ChildItem Cert:\\LocalMachine\\Root | ForEach-Object {{
+       "-----BEGIN CERTIFICATE-----"
+       [Convert]::ToBase64String($_.RawData, 'InsertLineBreaks')
+       "-----END CERTIFICATE-----"
+     }} | Out-File -Encoding ascii corp-ca.pem
+
+3. Retry against that bundle:
+     $env:PROBE_CA_BUNDLE = "$PWD\\corp-ca.pem"; uv run .\\probe.py
+"""
+
+_UNIX_TLS_HELP = """\
+1. See which CA actually signs the endpoint:
+     openssl s_client -showcerts -connect {host} </dev/null 2>/dev/null \\
+       | openssl x509 -noout -issuer -subject
+
+2. Export your system roots to a PEM bundle (macOS):
+     security find-certificate -a -p \\
+       /Library/Keychains/System.keychain \\
+       /System/Library/Keychains/SystemRootCertificates.keychain \\
+       > corp-ca.pem
+
+   On Linux the bundle is usually already at:
+     /etc/ssl/certs/ca-certificates.crt   (Debian/Ubuntu)
+     /etc/pki/tls/certs/ca-bundle.crt     (RHEL/Fedora)
+
+3. Retry against that bundle:
+     PROBE_CA_BUNDLE=$PWD/corp-ca.pem uv run probe.py
+"""
+
+
 def explain_tls_failure(exc: Exception) -> None:
-    """Turn an opaque TLS error into the specific next action."""
+    """Turn an opaque TLS error into the specific next action, per platform."""
     print("\n" + "=" * 60, file=sys.stderr)
     print(f"TLS verification failed: {exc}", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
     host = BASE_URL.split("://", 1)[-1].split("/", 1)[0]
     if ":" not in host:
         host += ":443"
+    help_text = (
+        _WINDOWS_TLS_HELP.format(url=BASE_URL)
+        if sys.platform == "win32"
+        else _UNIX_TLS_HELP.format(host=host)
+    )
     print(
         "\nThis usually means a corporate CA is intercepting the connection and\n"
-        "is not in the trust store being used.\n\n"
-        "1. See which CA actually signs the endpoint:\n"
-        f"     openssl s_client -showcerts -connect {host} </dev/null 2>/dev/null \\\n"
-        "       | openssl x509 -noout -issuer -subject\n\n"
-        "2. Export your system roots to a PEM bundle (macOS):\n"
-        "     security find-certificate -a -p \\\n"
-        "       /Library/Keychains/System.keychain \\\n"
-        "       /System/Library/Keychains/SystemRootCertificates.keychain \\\n"
-        "       > corp-ca.pem\n\n"
-        "3. Retry against that bundle:\n"
-        "     PROBE_CA_BUNDLE=$PWD/corp-ca.pem uv run probe.py\n\n"
+        "is not in the trust store being used.\n\n" + help_text + "\n"
         "If step 1 shows an issuer your machine has never been given, ask IT for\n"
         "the root CA PEM -- do not work around it with PROBE_TLS=insecure.\n",
         file=sys.stderr,
@@ -367,12 +400,27 @@ def preflight(client: httpx.Client) -> None:
         pass  # non-TLS errors are the individual probes' business
 
 
+def redact_proxy(url: str) -> str:
+    """Strip credentials from a proxy URL.
+
+    Corporate proxies are commonly configured as
+    http://user:password@proxy:8080, so printing the raw value leaks a domain
+    password into terminal scrollback, screenshots and CI logs.
+    """
+    if not url or "@" not in url:
+        return url or "none"
+    scheme, _, rest = url.partition("://")
+    userinfo, _, hostpart = rest.rpartition("@")
+    user = userinfo.partition(":")[0]
+    return f"{scheme}://{user}:***@{hostpart}" if user else f"{scheme}://***@{hostpart}"
+
+
 def main() -> None:
     verify = build_verify()
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "none"
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
     print(f"Probing {BASE_URL}", flush=True)
     print(f"TLS trust : {results['_tls_mode']}", flush=True)
-    print(f"Proxy     : {proxy}", flush=True)
+    print(f"Proxy     : {redact_proxy(proxy)}", flush=True)
     print("=" * 60, flush=True)
     with httpx.Client(timeout=TIMEOUT, follow_redirects=True, verify=verify) as client:
         preflight(client)
