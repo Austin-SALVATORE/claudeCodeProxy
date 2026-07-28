@@ -6,8 +6,93 @@ Messages API and OpenAI Chat Completions.
 
 ## Status
 
-Pre-design. Only the capability probe exists so far — the proxy itself is not
-built yet, and its architecture depends on what the probe reports.
+Working, not yet run against the real gateway. 79 tests, 88% coverage, all
+against a mocked upstream — the live end-to-end run is the next step.
+
+## Quick start
+
+```bash
+uv venv && uv pip install -e ".[dev]"
+cp .env.example .env        # then edit it
+uv run ccproxy
+```
+
+Point Claude Code at it:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_API_KEY=unused     # required by the client, ignored by the proxy
+claude
+```
+
+```powershell
+# PowerShell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
+$env:ANTHROPIC_API_KEY  = "unused"
+claude
+```
+
+## Model mapping
+
+Which upstream model backs each Claude Code tier is entirely configuration —
+no model name is hardcoded in the request path.
+
+| Env var | Default | When Claude Code uses it |
+| --- | --- | --- |
+| `CCPROXY_MODEL_OPUS` | `gemma-4-31b-ITG` | Only when Opus is explicitly selected |
+| `CCPROXY_MODEL_SONNET` | `qwen-latest` | **The main agent loop — most turns** |
+| `CCPROXY_MODEL_HAIKU` | `qwen-3-coder-next` | Background: titles, summarisation |
+| `CCPROXY_DEFAULT_TIER` | `sonnet` | Fallback when a request matches no tier |
+| `CCPROXY_MODEL_MAP` | *(unset)* | JSON of exact-id overrides, applied first |
+
+Tiers are matched by **substring**, so dated ids keep working:
+`claude-sonnet-4-5-20250929` → sonnet → `qwen-latest`. Anthropic ships new
+dated ids regularly, and exact-match config would silently break on each one.
+
+For a one-off experiment without editing `.env`:
+
+```bash
+CCPROXY_MODEL_SONNET=gpt-oss-120b uv run ccproxy
+```
+
+`/health` reports the live mapping, and every request logs
+`requested -> upstream (tier)`.
+
+> **On `qwen-latest`:** it is a floating alias. Pointing the workhorse tier at
+> one means the gateway can repoint it during maintenance and Claude Code's
+> behaviour changes with no signal. Pin the concrete version once you know what
+> it resolves to.
+
+## Architecture
+
+| Module | Responsibility |
+| --- | --- |
+| `config.py` | Env-driven settings, tier resolution, validation |
+| `translate/request.py` | Anthropic → OpenAI. Tool blocks, images, `cache_control` stripping |
+| `translate/response.py` | OpenAI → Anthropic, including the SSE state machine |
+| `upstream.py` | httpx client, TLS trust, proxy-credential redaction |
+| `errors.py` | Anthropic-shaped error envelopes |
+| `app.py` | Routing, streaming, `/health` |
+
+Stateless: every request is translated independently, no session storage.
+
+### Known limitations
+
+- **No prompt caching.** The gateway reports no cache token accounting, so
+  `cache_control` markers are stripped and every turn re-sends full context at
+  full cost. This is the main cost difference versus Anthropic-hosted Claude.
+- **`count_tokens` is approximate** (~4 chars/token). The gateway exposes no
+  tokeniser, so the endpoint answers rather than failing the request.
+- **Context ceiling unverified.** The probe confirmed 22k tokens; Claude Code
+  routinely exceeds that. The real limit per model is still unmeasured.
+
+## Development
+
+```bash
+uv run pytest              # 79 tests, coverage report
+uv run ruff check src tests
+uv run ruff format src tests
+```
 
 ## Probe
 
