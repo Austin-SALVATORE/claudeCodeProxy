@@ -252,3 +252,106 @@ class TestRedaction:
     )
     def test_proxy_password_never_logged(self, given, expected):
         assert redact_proxy(given) == expected
+
+
+CONTEXT_ERROR = (
+    "This model's maximum context length is 262144 tokens. However, you requested 64000 "
+    "output tokens and your prompt contains at least 198145 input tokens, for a total of "
+    "at least 262145 tokens. (parameter=input_tokens, value=198145)"
+)
+
+
+class TestContextWindow:
+    @respx.mock
+    def test_oversized_max_tokens_is_clamped_before_sending(self, client):
+        route = respx.post(COMPLETIONS).mock(
+            return_value=httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+            )
+        )
+        client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64000,
+                # ~250k estimated tokens: leaves less than the requested 64000
+                "messages": [{"role": "user", "content": "x" * 800_000}],
+            },
+        )
+        sent = json.loads(route.calls[0].request.content)
+        assert sent["max_tokens"] < 64000
+        assert sent["max_tokens"] >= 512
+
+    @respx.mock
+    def test_gateway_rejection_triggers_one_corrected_retry(self, client):
+        route = respx.post(COMPLETIONS).mock(
+            side_effect=[
+                httpx.Response(400, text=CONTEXT_ERROR),
+                httpx.Response(
+                    200,
+                    json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+                ),
+            ]
+        )
+        r = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64000,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert r.status_code == 200
+        assert len(route.calls) == 2
+        retried = json.loads(route.calls[1].request.content)
+        assert retried["max_tokens"] == 262144 - 198145 - 3072
+
+    @respx.mock
+    def test_unrelated_400_is_not_retried(self, client):
+        route = respx.post(COMPLETIONS).mock(
+            return_value=httpx.Response(400, text='{"error":"bad tool schema"}')
+        )
+        r = client.post(
+            "/v1/messages",
+            json={"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r.status_code == 400
+        assert len(route.calls) == 1
+
+    @respx.mock
+    def test_streaming_retries_on_context_error(self, client):
+        respx.post(COMPLETIONS).mock(
+            side_effect=[
+                httpx.Response(400, text=CONTEXT_ERROR),
+                httpx.Response(
+                    200,
+                    content=sse(
+                        {"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}
+                    ),
+                    headers={"Content-Type": "text/event-stream"},
+                ),
+            ]
+        )
+        r = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64000,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert "event: error" not in r.text
+        assert r.text.rstrip().endswith('{"type": "message_stop"}')
+
+    def test_prompt_with_no_room_left_asks_claude_code_to_compact(self, client):
+        r = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": "x" * 3_000_000}],
+            },
+        )
+        assert r.status_code == 400
+        assert "prompt is too long" in r.json()["error"]["message"]

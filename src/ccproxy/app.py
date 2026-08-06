@@ -15,11 +15,65 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import Settings, from_env
 from .errors import error_body, upstream_error
+from .limits import PromptTooLong, clamp_max_tokens, parse_context_error
 from .translate.request import TranslationError, build_openai_request
 from .translate.response import StreamTranslator, build_anthropic_response, format_sse
 from .upstream import build_client, redact_proxy
 
 log = logging.getLogger("ccproxy")
+
+
+def fit_to_window(
+    payload: dict[str, Any],
+    settings: Settings,
+    upstream_model: str,
+    *,
+    input_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Shrink max_tokens so input + output fits the gateway's single window."""
+    return clamp_max_tokens(
+        payload,
+        context_window=settings.window_for(upstream_model),
+        margin=settings.token_margin,
+        floor=settings.min_output_tokens,
+        ceiling=settings.max_output_tokens or None,
+        input_tokens=input_tokens,
+    )
+
+
+def retry_payload(
+    payload: dict[str, Any], settings: Settings, upstream_model: str, body: str
+) -> dict[str, Any] | None:
+    """Rebuild a payload from a gateway context-length rejection.
+
+    The error carries the gateway's own input-token count, which beats any
+    estimate we can make. Returns None if this was not a context error, or if
+    the numbers leave no room for a reply.
+    """
+    overflow = parse_context_error(body)
+    if overflow is None:
+        return None
+    window = overflow.context_window or settings.window_for(upstream_model)
+    try:
+        adjusted = clamp_max_tokens(
+            payload,
+            context_window=window,
+            margin=settings.token_margin,
+            floor=settings.min_output_tokens,
+            ceiling=settings.max_output_tokens or None,
+            input_tokens=overflow.input_tokens,
+        )
+    except PromptTooLong:
+        return None
+    if adjusted.get("max_tokens") == payload.get("max_tokens"):
+        return None  # nothing changed; retrying would just fail again
+    log.warning(
+        "context overflow: retrying with max_tokens=%s (input=%s, window=%s)",
+        adjusted.get("max_tokens"),
+        overflow.input_tokens,
+        window,
+    )
+    return adjusted
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -81,18 +135,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         try:
             payload = build_openai_request(body, upstream_model)
+            payload = fit_to_window(payload, settings, upstream_model)
         except TranslationError as exc:
+            return JSONResponse(status_code=400, content=error_body(400, str(exc)))
+        except PromptTooLong as exc:
+            # Claude Code compacts the conversation when it sees this wording.
+            log.warning("%s", exc)
             return JSONResponse(status_code=400, content=error_body(400, str(exc)))
 
         if payload["stream"]:
             return StreamingResponse(
-                _stream(client, payload, requested),
+                _stream(client, payload, requested, settings, upstream_model),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
         try:
             response = await client.post("/chat/completions", json=payload)
+            if response.status_code == 400:
+                retried = retry_payload(payload, settings, upstream_model, response.text)
+                if retried is not None:
+                    response = await client.post("/chat/completions", json=retried)
             response.raise_for_status()
         except Exception as exc:  # noqa: BLE001 - mapped to an Anthropic error
             status, content = upstream_error(exc)
@@ -104,7 +167,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 async def _stream(
-    client: httpx.AsyncClient, payload: dict[str, Any], model: str
+    client: httpx.AsyncClient,
+    payload: dict[str, Any],
+    model: str,
+    settings: Settings,
+    upstream_model: str,
+    retries_left: int = 1,
 ) -> AsyncIterator[str]:
     """Proxy the upstream SSE stream, translated to Anthropic events.
 
@@ -117,8 +185,21 @@ async def _stream(
         async with client.stream("POST", "/chat/completions", json=payload) as response:
             if response.status_code != 200:
                 raw = await response.aread()
-                detail = raw.decode("utf-8", "replace")[:500]
-                yield format_sse(("error", error_body(response.status_code, f"upstream: {detail}")))
+                detail = raw.decode("utf-8", "replace")
+                retried = (
+                    retry_payload(payload, settings, upstream_model, detail)
+                    if response.status_code == 400 and retries_left > 0
+                    else None
+                )
+                if retried is not None:
+                    async for frame in _stream(
+                        client, retried, model, settings, upstream_model, retries_left - 1
+                    ):
+                        yield frame
+                    return
+                yield format_sse(
+                    ("error", error_body(response.status_code, f"upstream: {detail[:500]}"))
+                )
                 for event in translator.finish():
                     yield format_sse(event)
                 return

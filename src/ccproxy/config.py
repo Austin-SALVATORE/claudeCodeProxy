@@ -40,6 +40,13 @@ class Settings:
     port: int = 8787
     timeout: float = 600.0
     log_level: str = "info"
+    # Total input+output budget the gateway enforces per request.
+    context_window: int = 262144
+    context_windows: Mapping[str, int] = field(default_factory=dict)
+    # Headroom for the estimate being wrong, plus the template the server adds.
+    token_margin: int = 3072
+    min_output_tokens: int = 512
+    max_output_tokens: int = 0  # 0 = no additional ceiling
 
     def __post_init__(self) -> None:
         if not self.upstream_url:
@@ -61,6 +68,19 @@ class Settings:
             )
         if self.ca_bundle and not Path(self.ca_bundle).is_file():
             raise ConfigError(f"CCPROXY_CA_BUNDLE does not exist: {self.ca_bundle}")
+        if self.context_window <= 0:
+            raise ConfigError("CCPROXY_CONTEXT_WINDOW must be positive")
+        if self.min_output_tokens <= 0:
+            raise ConfigError("CCPROXY_MIN_OUTPUT_TOKENS must be positive")
+        if self.context_window <= self.token_margin + self.min_output_tokens:
+            raise ConfigError(
+                "CCPROXY_CONTEXT_WINDOW leaves no room once the margin and minimum "
+                "output reservation are subtracted"
+            )
+
+    def window_for(self, upstream_model: str) -> int:
+        """Context window for an upstream model, falling back to the global one."""
+        return self.context_windows.get(upstream_model, self.context_window)
 
     def resolve_model(self, requested: str) -> str:
         """Map a requested Claude model id onto an upstream model id.
@@ -129,6 +149,21 @@ def _env_model_map(name: str) -> Mapping[str, str]:
     return dict(parsed)
 
 
+def _env_window_map(name: str) -> Mapping[str, int]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{name} must be a JSON object: {exc}") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and isinstance(v, int) and v > 0 for k, v in parsed.items()
+    ):
+        raise ConfigError(f"{name} must be a JSON object of model -> positive integer")
+    return dict(parsed)
+
+
 def load_dotenv(path: str | Path = ".env") -> None:
     """Load KEY=VALUE lines into os.environ without overriding existing vars.
 
@@ -166,4 +201,9 @@ def from_env() -> Settings:
         port=_env_int("CCPROXY_PORT", 8787),
         timeout=_env_float("CCPROXY_TIMEOUT", 600.0),
         log_level=os.environ.get("CCPROXY_LOG_LEVEL", "info").strip().lower(),
+        context_window=_env_int("CCPROXY_CONTEXT_WINDOW", 262144),
+        context_windows=_env_window_map("CCPROXY_CONTEXT_WINDOWS"),
+        token_margin=_env_int("CCPROXY_TOKEN_MARGIN", 3072),
+        min_output_tokens=_env_int("CCPROXY_MIN_OUTPUT_TOKENS", 512),
+        max_output_tokens=_env_int("CCPROXY_MAX_OUTPUT_TOKENS", 0),
     )
